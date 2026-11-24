@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panomotion"
+version = "0.1.0"
+description = "Spherical motion estimation for 360/equirectangular video, with an interactive motion-analysis player"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pillow>=10",
+    "imageio>=2.34",
+    "imageio-ffmpeg>=0.5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+pano-player = "panomotion.cli:main"
+panomotion = "panomotion.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["panomotion*"]
+
+[tool.setuptools.package-data]
+panomotion = ["web/*", "fonts/*"]

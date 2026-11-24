@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='%231470a8'/%3E%3Cellipse cx='16' cy='16' rx='6' ry='13' fill='none' stroke='%239fe4ff' stroke-width='1.6'/%3E%3Cpath d='M3 16h26M5 10h22M5 22h22' stroke='%239fe4ff' stroke-width='1.4'/%3E%3C/svg%3E" />
+<title>全景球面运动分析播放器 · Panomotion</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◎</span>
+    <div>
+      <h1>全景球面运动分析播放器</h1>
+      <span class="subtitle">等距柱状像素 → 球面方向 · 局部切平面匹配 · 方向对应与接缝核查</span>
+    </div>
+  </div>
+  <div class="top-actions">
+    <label class="run-select">数据集
+      <select id="runSelect"></select>
+    </label>
+    <button id="rebuildBtn" class="btn primary">重新合成并分析 Demo</button>
+  </div>
+</header>
+
+<div id="jobBar" class="jobbar hidden">
+  <div class="job-row">
+    <span id="jobMsg">准备中…</span>
+    <span id="jobPct">0%</span>
+  </div>
+  <div class="progress"><div id="jobFill" class="fill"></div></div>
+</div>
+
+<main class="layout">
+  <section class="stage-col">
+    <div class="card viewer-card">
+      <div class="card-head">
+        <h2>球面视图（可拖动旋转 · 滚轮缩放 · 点击查运动）</h2>
+        <div class="layer-switch" id="layerSwitch">
+          <button data-layer="frames" class="seg active">原始帧</button>
+          <button data-layer="reproj" class="seg">重投影</button>
+          <button data-layer="error" class="seg">残差</button>
+        </div>
+      </div>
+      <div class="canvas-wrap sphere-wrap">
+        <canvas id="sphereCanvas" width="820" height="430"></canvas>
+        <div class="hint" id="sphereHint">拖动旋转视角</div>
+      </div>
+
+      <div class="toolbar">
+        <button id="playBtn" class="btn primary">▶ 播放</button>
+        <input type="range" id="pairSlider" min="0" max="10" value="0" class="slider" />
+        <span id="pairLabel" class="pair-label">帧对 0 → 1</span>
+        <span class="speed">速度
+          <select id="speedSel">
+            <option value="1200">0.5x</option>
+            <option value="700" selected>1x</option>
+            <option value="350">2x</option>
+          </select>
+        </span>
+      </div>
+
+      <div class="toggles">
+        <label><input type="checkbox" id="tgEst" checked /> 估计方向运动</label>
+        <label><input type="checkbox" id="tgGt" checked /> 真实运动 GT</label>
+        <label><input type="checkbox" id="tgTracks" checked /> 轨迹</label>
+        <label><input type="checkbox" id="tgSeam" checked /> 经度接缝</label>
+        <label><input type="checkbox" id="tgPolar" checked /> 极区标注</label>
+        <label><input type="checkbox" id="tgRejected" /> 未支持匹配点</label>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>展开图（等距柱状）中的同一轨迹与接缝</h2></div>
+      <div class="canvas-wrap equirect-wrap">
+        <canvas id="equirectCanvas" width="960" height="480"></canvas>
+      </div>
+      <div class="legend">
+        <span><i class="dot global"></i>相机旋转一致</span>
+        <span><i class="dot local"></i>局部物体运动</span>
+        <span><i class="dot rejected"></i>未支持/拒绝</span>
+        <span><i class="line gt"></i>GT 方向</span>
+        <span><i class="line est"></i>估计方向</span>
+        <span><i class="line seam"></i>±180° 接缝</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>交付视频：真实运动、估计球面运动与重投影检查</h2></div>
+      <div class="videos" id="videoPanel"></div>
+    </div>
+  </section>
+
+  <aside class="side-col">
+    <section class="card">
+      <div class="card-head"><h2>总览指标</h2></div>
+      <div id="summaryGrid" class="metric-grid"></div>
+      <div id="baselineBox" class="baseline"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>当前帧对：球面位移</h2></div>
+      <div id="pairStats" class="pair-stats"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>选中点 / 轨迹</h2></div>
+      <div id="inspector" class="inspector"><p class="muted">在球面或展开图上点击采样点或轨迹。</p></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>接缝连续性（实际运算）</h2></div>
+      <div id="seamBox"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>异常提示（球面运动界面）</h2></div>
+      <div id="anomalyBox" class="anomalies"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>轨迹列表</h2></div>
+      <div id="trackList" class="track-list"></div>
+    </section>
+
+    <section class="card docs">
+      <div class="card-head"><h2>球面运动入口与说明</h2></div>
+      <p>图形入口：<code>python -m panomotion gui</code>（或 <code>pano-player</code>）。</p>
+      <p>命令行仅作辅助：<code>panomotion synth</code> 合成已知旋转序列；
+        <code>panomotion analyze &lt;帧目录或视频&gt;</code> 分析自有等距柱状素材。</p>
+      <p class="muted">所有位移均以单位球面方向、测地线弧长（度）与世界系旋转向量表示；
+        跨极点自动切换局部坐标基，经度接缝按邻接处理。</p>
+    </section>
+  </aside>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

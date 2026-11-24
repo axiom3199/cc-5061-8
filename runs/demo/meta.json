@@ -1,0 +1,1 @@
+{"name": "demo", "width": 960, "height": 480, "n_frames": 12, "cols": 64, "rows": 32, "fps": 5.0, "has_ground_truth": true, "created": "2026-11-24 21:25:28", "graphical_entry": "python -m panomotion gui"}
