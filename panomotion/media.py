@@ -89,22 +89,16 @@ def slerp(d0, d1, t):
 
 
 def geodesic_segments(d0, d1, width: int, height: int, n: int = 14):
-    """Pixel-space polylines of the shortest spherical path, split at seam."""
-    ts = np.linspace(0.0, 1.0, n)
-    pts = np.stack([slerp(d0, d1, t) for t in ts])
-    u, v = sphere.direction_to_pixel(pts, width, height)
-    segments = []
-    cur = [(float(u[0]), float(v[0]))]
-    for k in range(1, n):
-        if abs(u[k] - u[k - 1]) > width / 2.0:
-            if len(cur) >= 2:
-                segments.append(cur)
-            cur = [(float(u[k]), float(v[k]))]
-        else:
-            cur.append((float(u[k]), float(v[k])))
-    if len(cur) >= 2:
-        segments.append(cur)
-    return segments
+    """Pixel-space polylines of the shortest spherical path, split at seam.
+
+    Splitting is delegated to the equirect projection outlet so video
+    annotations and the interactive player share one seam rule.
+    """
+    from .projection import EquirectProjection, geodesic_polyline
+    pts = geodesic_polyline(np.asarray(d0, float), np.asarray(d1, float),
+                            samples=n)
+    fragments = EquirectProjection(width, height).project_polyline(pts, 0)
+    return [[list(p) for p in f.points] for f in fragments]
 
 
 def draw_spherical_arrow(pil_img: Image.Image, d0, d1, color=(255, 255, 0),
@@ -113,7 +107,8 @@ def draw_spherical_arrow(pil_img: Image.Image, d0, d1, color=(255, 255, 0),
     draw = ImageDraw.Draw(pil_img)
     segments = geodesic_segments(np.asarray(d0, float), np.asarray(d1, float), w, h)
     for seg in segments:
-        draw.line(seg, fill=color, width=width_px, joint="curve")
+        draw.line([tuple(p) for p in seg], fill=color, width=width_px,
+                  joint="curve")
     if segments:
         end = segments[-1][-1]
         prev = segments[-1][-2] if len(segments[-1]) >= 2 else segments[-1][0]
@@ -121,28 +116,19 @@ def draw_spherical_arrow(pil_img: Image.Image, d0, d1, color=(255, 255, 0),
         for da in (2.5, -2.5):
             p = (end[0] + head * np.cos(ang + da),
                  end[1] + head * np.sin(ang + da))
-            draw.line([end, p], fill=color, width=width_px)
+            draw.line([tuple(end), tuple(p)], fill=color, width=width_px)
 
 
 def draw_track(pil_img: Image.Image, dirs, color=(0, 255, 200),
                width_px: int = 2):
     """Draw a direction trajectory with seam splitting."""
+    from .projection import EquirectProjection
     w, h = pil_img.size
     draw = ImageDraw.Draw(pil_img)
-    pts = []
-    for d in dirs:
-        u, v = sphere.direction_to_pixel(np.asarray(d, float), w, h)
-        pts.append((float(u), float(v)))
-    cur = [pts[0]]
-    for k in range(1, len(pts)):
-        if abs(pts[k][0] - pts[k - 1][0]) > w / 2.0:
-            if len(cur) >= 2:
-                draw.line(cur, fill=color, width=width_px)
-            cur = [pts[k]]
-        else:
-            cur.append(pts[k])
-    if len(cur) >= 2:
-        draw.line(cur, fill=color, width=width_px)
+    fragments = EquirectProjection(w, h).project_polyline(
+        np.asarray(dirs, float), 0)
+    for f in fragments:
+        draw.line([tuple(p) for p in f.points], fill=color, width=width_px)
 
 
 def label_bar(img: np.ndarray, text: str, bar_h: int = 26) -> np.ndarray:

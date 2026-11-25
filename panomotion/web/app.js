@@ -73,13 +73,16 @@ function angDist(a, b) {
 // --------------------------------------------------------------- state ----
 const state = {
   runs: [], runName: "demo", meta: null, report: null, tracks: [],
+  hotspots: null, hotspotDoc: null, userHotspots: [],
   pairIndex: 0, pairCache: {}, pairData: null, loadSeq: 0,
   layer: "frames",
-  show: { est: true, gt: true, tracks: true, seam: true, polar: true, rejected: false },
+  show: { est: true, gt: true, tracks: true, seam: true, polar: true, rejected: false, hotspots: true },
   selection: null,
   playing: false, timer: null, intervalMs: 700,
   yaw: Math.PI / 2, pitch: 0.12, fov: 68,
   sphereDirty: true,
+  lastPickDir: null,
+  followHotspot: false,
 };
 
 const eqCanvas = $("equirectCanvas"), eqCtx = eqCanvas.getContext("2d");
@@ -130,18 +133,23 @@ async function selectRun(name) {
   state.pairCache = {};
   state.pairIndex = 0;
   state.selection = null;
-  const [meta, report, tracks] = await Promise.all([
+  const [meta, report, tracks, hotspotDoc] = await Promise.all([
     fjson(`/api/meta?name=${name}`),
     fjson(`/api/report?name=${name}`),
     fjson(`/api/tracks?name=${name}`),
+    fjson(`/api/hotspots?name=${name}`).catch(() => null),
   ]);
   state.meta = meta; state.report = report; state.tracks = tracks;
+  state.hotspotDoc = hotspotDoc;
+  state.hotspots = hotspotDoc ? hotspotDoc.hotspots : [];
+  state.userHotspots = [];
   $("pairSlider").max = Math.max(0, report.pairs.length - 1);
   $("pairSlider").value = 0;
   renderSummary();
   renderVideos();
   renderAnomalies();
   renderTrackList();
+  renderHotspotPanel();
   await loadPair(0);
 }
 
@@ -158,6 +166,7 @@ async function loadPair(i) {
   renderPairStats();
   renderSeam();
   renderInspector();
+  renderHotspotPanel();
   drawEquirect();
   refreshSourceAndSphere();
 }
@@ -263,6 +272,7 @@ function drawEquirectOverlays() {
   }
 
   if (state.show.tracks) drawAllTracksEquirect();
+  drawHotspotsEquirect();
 
   if (state.selection && state.selection.kind === "node") {
     const k = state.selection.k;
@@ -310,6 +320,114 @@ function trackReliable(t) {
   if (t.median_error_deg != null) return t.median_error_deg < 1.0;
   const acc = t.accepted.filter(Boolean).length / Math.max(1, t.accepted.length);
   return acc >= 0.6;
+}
+
+// ------------------------------------------------------------ hotspots ----
+function allHotspotObjects() {
+  // Pipeline hotspots (with per-frame chains) plus editor-added ones.
+  const objs = [];
+  for (const h of state.hotspots || []) {
+    const frame = h.frames && h.frames[String(state.pairIndex)];
+    const dir = frame ? frame.dir : h.anchor_dir;
+    objs.push({ id: h.hotspot_id, name: h.name, dir, radiusDeg: h.radius_deg,
+                source: "pipeline" });
+  }
+  state.userHotspots.forEach((h, idx) => {
+    objs.push({ id: 1000 + idx, name: h.name, dir: h.dir,
+                radiusDeg: h.radiusDeg, source: "editor" });
+  });
+  return objs;
+}
+
+function hotspotOutlineDirs(h) {
+  const c = ST.normalize(h.dir);
+  const up = [0, 1, 0];
+  let b1 = ST.normalize(ST.cross(up, c));
+  if (ST.norm(ST.cross(up, c)) < 1e-9) b1 = ST.normalize(ST.cross([1, 0, 0], c));
+  const b2 = ST.cross(c, b1);
+  const r = h.radiusDeg * D2R;
+  const out = [];
+  for (let k = 0; k < 64; k++) {
+    const a = k / 64 * TAU;
+    const tx = Math.cos(a) * r, ty = Math.sin(a) * r;
+    const theta = Math.hypot(tx, ty);
+    const move = [b1[0] * tx + b2[0] * ty, b1[1] * tx + b2[1] * ty,
+                  b1[2] * tx + b2[2] * ty];
+    if (theta < 1e-12) { out.push(c); continue; }
+    const u = [move[0] / theta, move[1] / theta, move[2] / theta];
+    const s = Math.sin(theta), co = Math.cos(theta);
+    out.push(ST.normalize([
+      c[0] * co + u[0] * s, c[1] * co + u[1] * s, c[2] * co + u[2] * s]));
+  }
+  return out;
+}
+
+function drawHotspotsEquirect() {
+  if (!state.show.hotspots) return;
+  const W = eqCanvas.width, H = eqCanvas.height, ctx = eqCtx;
+  for (const h of allHotspotObjects()) {
+    const dirs = hotspotOutlineDirs(h);
+    const pts = dirs.map((d) => {
+      const [x, y] = dirToPixel(d, W, H);
+      return { x, y };
+    });
+    const color = h.source === "editor" ? "#7dff8a" : "#ffd166";
+    const frags = ST.splitProjected(pts, (a, b) =>
+      Math.abs(b.x - a.x) > W / 2, h.id);
+    ctx.strokeStyle = color; ctx.lineWidth = 2.2;
+    for (const f of frags) {
+      ctx.beginPath();
+      ctx.moveTo(f.points[0].x, f.points[0].y);
+      f.points.forEach((p) => ctx.lineTo(p.x, p.y));
+      ctx.stroke();
+    }
+    const [cx, cy] = dirToPixel(ST.normalize(h.dir), W, H);
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(cx, cy, 3.4, 0, TAU); ctx.fill();
+  }
+}
+
+function drawHotspotsSphere() {
+  if (!state.show.hotspots) return;
+  const ctx = spCtx;
+  for (const h of allHotspotObjects()) {
+    const color = h.source === "editor" ? "rgba(125,255,138,.95)" : "rgba(255,209,102,.95)";
+    const dirs = hotspotOutlineDirs(h);
+    const pts = dirs.map((d) => projectDir(d));
+    const frags = ST.splitProjected(pts, () => false, h.id);
+    ctx.strokeStyle = color; ctx.lineWidth = 2.2;
+    for (const f of frags) {
+      ctx.beginPath();
+      ctx.moveTo(f.points[0].x, f.points[0].y);
+      f.points.forEach((p) => ctx.lineTo(p.x, p.y));
+      ctx.stroke();
+    }
+    const pc = projectDir(ST.normalize(h.dir));
+    if (pc) { ctx.fillStyle = color; ctx.beginPath(); ctx.arc(pc.x, pc.y, 3.6, 0, TAU); ctx.fill(); }
+  }
+}
+
+function renderHotspotPanel() {
+  const list = $("hotspotList");
+  const objs = allHotspotObjects();
+  list.innerHTML = objs.length
+    ? objs.map((h) => `<div class="hs-row" data-id="${h.id}">
+        <span class="hs-dot ${h.source}"></span>${h.name}
+        <span class="muted">r=${h.radiusDeg.toFixed(1)}° · id=${h.id}</span></div>`).join("")
+    : '<span class="muted">暂无热点。</span>';
+  const ev = $("hotspotEvidence");
+  const doc = state.hotspotDoc;
+  if (doc && doc.projection_checks) {
+    ev.innerHTML = doc.projection_checks.map((c) => `
+      <div class="hs-check ${c.same_spherical_object ? "ok" : "bad"}">
+        ${c.name}：等距柱状 ${c.equirect_fragment_count} 段 / 透视 ${c.perspective_fragment_count} 段，
+        同一球面对象 = ${c.same_spherical_object ? "是" : "否"}，
+        有效区 ${(c.valid_region_coverage * 100).toFixed(1)}%
+      </div>`).join("")
+      + (doc.gt_angular_error || []).map((g) => `
+      <div class="hs-check ok">${g.name}：GT 球面角误差中位 ${g.median_error_deg}°，
+        最大 ${g.max_error_deg}°，有效比例 ${g.valid_fraction}</div>`).join("");
+  }
 }
 
 function drawAllTracksEquirect() {
@@ -513,6 +631,7 @@ function drawSphereOverlays() {
     if (p) { ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(p.x, p.y, 8, 0, TAU); ctx.stroke(); }
   }
+  drawHotspotsSphere();
 }
 
 function drawSphereArrow(d0, d1, color, width = 1.8) {
@@ -771,6 +890,7 @@ function pickSphere(ev) {
   return resolvePick(normz(v));
 }
 function resolvePick(d) {
+  state.lastPickDir = ST.normalize(d);
   const pd = state.pairData;
   // Grid spacing is ~360/cols degrees; accept up to the cell half-diagonal.
   let bestK = -1, bestAng = 4.2;
@@ -812,9 +932,9 @@ function bindEvents() {
       drawEquirect(); refreshSourceAndSphere();
     };
   });
-  for (const key of ["Est", "Gt", "Tracks", "Seam", "Polar", "Rejected"]) {
+  for (const key of ["Est", "Gt", "Tracks", "Seam", "Polar", "Rejected", "Hotspots"]) {
     const map = { Est: "est", Gt: "gt", Tracks: "tracks", Seam: "seam",
-                  Polar: "polar", Rejected: "rejected" };
+                  Polar: "polar", Rejected: "rejected", Hotspots: "hotspots" };
     $("tg" + key).onchange = (e) => {
       state.show[map[key]] = e.target.checked;
       drawEquirect(); state.sphereDirty = true;
@@ -827,6 +947,15 @@ function bindEvents() {
     if (state.playing) { clearInterval(state.timer); startTimer(); }
   };
   $("rebuildBtn").onclick = startBuild;
+
+  $("btnAddHotspot").onclick = addHotspotAtPick;
+  $("btnClearHotspots").onclick = () => {
+    state.userHotspots = [];
+    renderHotspotPanel(); drawEquirect(); state.sphereDirty = true;
+  };
+  $("btnFollowHotspot").onclick = followFirstHotspot;
+  $("btnStepMotion").onclick = stepSphericalMotion;
+  $("btnStabilize").onclick = stabilizeHotspots;
 
   // equirect click
   eqCanvas.addEventListener("click", pickEquirect);
@@ -881,6 +1010,105 @@ function togglePlay() {
   state.playing = true;
   $("playBtn").textContent = "⏸ 暂停";
   startTimer();
+}
+
+// ----------------------------------------------------- motion controls ----
+function setMotionReadout(html) { $("motionReadout").innerHTML = html; }
+
+function addHotspotAtPick() {
+  if (!state.lastPickDir) {
+    setMotionReadout("请先在球面或展开图上点击一个方向，再添加热点。");
+    return;
+  }
+  const idx = state.userHotspots.length;
+  state.userHotspots.push({
+    name: `editor-hotspot-${idx + 1}`,
+    dir: state.lastPickDir.slice(),
+    radiusDeg: 5.0,
+  });
+  renderHotspotPanel();
+  drawEquirect();
+  state.sphereDirty = true;
+  const [lon, lat] = dirToLonLat(state.lastPickDir).map((x) => x * R2D);
+  setMotionReadout(`已添加热点，锚点方向 lon=${lon.toFixed(2)}° lat=${lat.toFixed(2)}°（球面方向，非像素）。`);
+}
+
+function yawPitchLookingAt(d) {
+  // Mirror backend PerspectiveProjection.look_at for the player's camera:
+  // rotate the view forward onto the target unit direction.
+  const [x, y, z] = d;
+  const pitch = Math.asin(Math.max(-1, Math.min(1, y)));
+  const yaw = Math.atan2(x, z);
+  return { yaw, pitch };
+}
+
+function followFirstHotspot() {
+  const objs = allHotspotObjects();
+  if (!objs.length) { setMotionReadout("当前没有可跟随的热点。"); return; }
+  const h = objs[0];
+  const { yaw, pitch } = yawPitchLookingAt(ST.normalize(h.dir));
+  state.yaw = yaw; state.pitch = pitch;
+  state.followHotspot = true;
+  state.sphereDirty = true;
+  const [lon, lat] = dirToLonLat(h.dir).map((x) => x * R2D);
+  setMotionReadout(`视角已转动到热点「${h.name}」(lon=${lon.toFixed(2)}°, lat=${lat.toFixed(2)}°)。`);
+}
+
+async function callMotionApi(dir) {
+  const i = state.pairIndex;
+  const q = dir.map((x) => encodeURIComponent(x.toFixed(6))).join(",");
+  return fjson(`/api/motion?name=${encodeURIComponent(state.runName)}&i=${i}&dir=${q}`);
+}
+
+async function stepSphericalMotion() {
+  if (!state.lastPickDir) {
+    setMotionReadout("请先点击一个方向，再推进该方向的球面运动。");
+    return;
+  }
+  try {
+    const res = await callMotionApi(state.lastPickDir);
+    const moved = res.moved_dir[0];
+    const arc = res.arc_deg[0];
+    const [lo0, la0] = dirToLonLat(state.lastPickDir).map((x) => x * R2D);
+    const [lo1, la1] = dirToLonLat(moved).map((x) => x * R2D);
+    setMotionReadout(
+      `帧对 ${res.pair} 真实 ω 场推进：(${lo0.toFixed(2)}°,${la0.toFixed(2)}°) → ` +
+      `(${lo1.toFixed(2)}°,${la1.toFixed(2)}°)，球面位移 <b>${arc.toFixed(3)}°</b>，` +
+      `主旋转向量 (${res.global_omega_deg.map((x) => x.toFixed(3)).join(", ")})°`);
+    state.lastPickDir = ST.normalize(moved);
+    state.sphereDirty = true;
+  } catch (e) {
+    setMotionReadout("运动接口调用失败：" + e.message);
+  }
+}
+
+async function stabilizeHotspots() {
+  const objs = allHotspotObjects().filter((h) => h.source === "pipeline");
+  if (!objs.length) { setMotionReadout("没有带运动场链的管线热点可稳定。"); return; }
+  // Ask the backend to advance the first pipeline hotspot through the real
+  // field, proving frame-to-frame stability rather than showing fixed data.
+  const h = objs[0];
+  try {
+    const i = state.pairIndex;
+    const res = await fjson(
+      `/api/motion?name=${encodeURIComponent(state.runName)}&i=${i}&hotspot=${h.id}`);
+    const before = ST.normalize(h.dir);
+    const after = ST.normalize(res.moved_dir[0]);
+    const seam = Math.abs(ST.wrapLongitude(dirToLonLat(after)[0]
+      - dirToLonLat(before)[0])) < Math.abs(
+      dirToLonLat(after)[0] - dirToLonLat(before)[0]);
+    setMotionReadout(
+      `热点「${h.name}」由 ω 场推进，球面位移 ${res.arc_deg[0].toFixed(3)}°；` +
+      `锚点始终是同一球面对象 id=${h.id}` +
+      (seam ? "（含经度环绕，方向向量传递无接缝跳变）" : "") + "。");
+    if (state.followHotspot) {
+      const { yaw, pitch } = yawPitchLookingAt(after);
+      state.yaw = yaw; state.pitch = pitch;
+    }
+    state.sphereDirty = true;
+  } catch (e) {
+    setMotionReadout("稳定接口调用失败：" + e.message);
+  }
 }
 
 // ------------------------------------------------------------- build ------

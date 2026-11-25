@@ -20,7 +20,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from . import sphere
-from .warp import sample_equirect
+from .sampling import sample_equirect
 
 
 def rotation_from_to(a, b):

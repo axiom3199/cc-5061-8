@@ -134,6 +134,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._file(WEB_DIR / "index.html")
         if path == "/app.js":
             return self._file(WEB_DIR / "app.js")
+        if path == "/sphere_transform.js":
+            return self._file(WEB_DIR / "sphere_transform.js")
         if path == "/styles.css":
             return self._file(WEB_DIR / "styles.css")
 
@@ -148,6 +150,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.api_simple(q, "meta.json")
         if path == "/api/tracks":
             return self.api_simple(q, "tracks.json")
+        if path == "/api/hotspots":
+            return self.api_simple(q, "hotspots.json")
+        if path == "/api/motion":
+            return self.api_motion(q)
         if path == "/api/pair":
             name = q.get("name", ["demo"])[0]
             i = int(q.get("i", ["0"])[0])
@@ -213,6 +219,62 @@ class Handler(BaseHTTPRequestHandler):
         if p is None or not p.exists():
             return self._json({"error": f"{fname} not found for run {name}"}, 404)
         return self._file(p)
+
+    def api_motion(self, q):
+        """Spherical motion transport evaluated by the backend, not by fixed
+        client data.  Given directions (or a hotspot id), return the advanced
+        directions and geodesic displacement for the requested frame pair."""
+        import numpy as np
+        from . import sphere
+        from .field import interpolate_omega_grid
+        name = q.get("name", ["demo"])[0]
+        pair_i = int(q.get("i", ["0"])[0])
+        pair_p = self._run_path(name, "data", f"pair_{pair_i:03d}.json")
+        if pair_p is None or not pair_p.exists():
+            return self._json({"error": "pair not found"}, 404)
+        pair = json.loads(pair_p.read_text("utf-8"))
+        omega_grid = np.asarray(pair["omega_grid"], dtype=np.float64)
+        global_omega = np.asarray(pair["global_omega"], dtype=np.float64)
+        W, H = int(pair["width"]), int(pair["height"])
+        omega_px = interpolate_omega_grid(omega_grid, W, H)
+
+        def advance(dirs):
+            u, v = sphere.direction_to_pixel(np.asarray(dirs, float), W, H)
+            from .sampling import sample_equirect
+            w_at = sample_equirect(omega_px, u, v)
+            return sphere.rodrigues(w_at, np.asarray(dirs, float))
+
+        dirs = None
+        if "dir" in q:
+            vals = [float(x) for x in q["dir"][0].split(",")]
+            dirs = np.asarray(vals, dtype=np.float64).reshape(-1, 3)
+        elif "hotspot" in q:
+            hs_p = self._run_path(name, "hotspots.json")
+            if hs_p is None or not hs_p.exists():
+                return self._json({"error": "hotspots not found"}, 404)
+            hs_doc = json.loads(hs_p.read_text("utf-8"))
+            hid = int(q["hotspot"][0])
+            hs = next((h for h in hs_doc["hotspots"]
+                       if h["hotspot_id"] == hid), None)
+            if hs is None:
+                return self._json({"error": "hotspot not found"}, 404)
+            key = str(pair_i)
+            frames = hs.get("frames", {})
+            if key not in frames:
+                return self._json({"error": "hotspot frame out of range"}, 404)
+            dirs = np.asarray(frames[key]["dir"], dtype=np.float64).reshape(-1, 3)
+        if dirs is None:
+            return self._json({"error": "provide dir or hotspot"}, 400)
+        moved = advance(dirs)
+        arc = np.rad2deg(sphere.geodesic_angle(dirs, moved))
+        return self._json({
+            "pair": pair_i,
+            "src_dir": np.round(dirs, 8).tolist(),
+            "moved_dir": np.round(moved, 8).tolist(),
+            "arc_deg": np.round(arc, 5).tolist(),
+            "global_omega_deg": np.round(
+                np.rad2deg(global_omega), 6).tolist(),
+        })
 
 
 def serve(host: str = "127.0.0.1", port: int = 8765,

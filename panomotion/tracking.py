@@ -6,9 +6,8 @@ from dataclasses import replace
 
 import numpy as np
 
-from . import sphere
+from . import sphere, topology
 from .estimate import MatchConfig, match_batch, luminance
-
 
 def fibonacci_directions(count: int):
     i = np.arange(count)
@@ -150,7 +149,8 @@ def compute_tracks(frames, seeds, global_Rs, seq=None,
 
             # Coordinate-singularity showcase: NAIVE wrapped-lon jump vs the
             # true geodesic step.  Across the seam the naive jump approaches
-            # 360 degrees; over a pole it flips by ~180 degrees.
+            # 360 degrees; over a pole it flips by ~180 degrees.  The boundary
+            # classification itself is owned by topology.
             naive_jump = np.abs(np.diff(glo))
             lon_u = np.unwrap(glo)
             real_lon_step = np.abs(np.diff(lon_u))
@@ -162,12 +162,47 @@ def compute_tracks(frames, seeds, global_Rs, seq=None,
             item["arc_at_jump_deg"] = round(float(steps[j]), 3)
             # A longitude jump at high latitude is the pole singularity, not a
             # seam crossing; keep the two badges mutually distinguishable.
-            lat_at_jump = float(np.max(np.abs(gla[max(0, j - 1):j + 2])))
-            jump_is_adjacency = bool(naive_jump[j] > np.deg2rad(120)
-                                     and steps[j] < 15.0)
-            item["crosses_pole"] = bool(np.max(np.abs(gla)) > np.deg2rad(85)
-                                        and jump_is_adjacency)
-            item["crosses_seam"] = bool(jump_is_adjacency
-                                        and lat_at_jump < np.deg2rad(70))
+            pole_flags = topology.crosses_pole_lonlat(glo, gla)
+            seam_steps = topology.crosses_seam_lonlat(glo[:-1], glo[1:])
+            item["crosses_pole"] = bool(pole_flags.any())
+            item["crosses_seam"] = bool((seam_steps & ~pole_flags[1:]).any())
         tracks.append(item)
     return tracks
+
+
+def track_hotspot_anchor(frames, anchor_dir, global_Rs,
+                         cfg: MatchConfig | None = None):
+    """Drive one hotspot anchor through every frame pair on the sphere.
+
+    The anchor is a unit direction; each step re-runs the same spherical
+    tangent-plane matcher used by the estimator and keeps the measured target
+    whenever it is photometrically supported (local object motion is allowed
+    to disagree with the dominant camera rotation).  On a weak step the anchor
+    still advances with the measured direction when the match is plausible,
+    and only falls back to the global rotation when there is no usable match.
+    Everything is exchanged as world directions, so the chain is valid across
+    the longitude seam and over the poles.
+    """
+    base_cfg = cfg or MatchConfig()
+    cfg = replace(base_cfg, search_step_deg=1.0, search_radius_deg=10.0)
+    anchor = sphere.normalize(np.asarray(anchor_dir, dtype=np.float64))
+    chain = [anchor.copy()]
+    weak_steps = []
+    for t in range(len(frames) - 1):
+        lum_a, lum_b = luminance(frames[t]), luminance(frames[t + 1])
+        h, w = lum_a.shape
+        m = match_batch(lum_a, lum_b, anchor[None, :], w, h, cfg)
+        target = m["target"][0]
+        ncc = float(m["ncc"][0])
+        texture = float(m["texture"][0])
+        R = global_Rs[t] if global_Rs is not None else np.eye(3)
+        predicted = sphere.rotate_dirs(R, anchor[None, :])[0]
+        if ncc >= 0.5 and texture >= 0.012:
+            anchor = sphere.normalize(target)
+            if ncc < 0.68:
+                weak_steps.append(t)
+        else:
+            anchor = sphere.normalize(predicted)
+            weak_steps.append(t)
+        chain.append(anchor.copy())
+    return np.stack(chain), weak_steps

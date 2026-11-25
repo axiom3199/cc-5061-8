@@ -17,8 +17,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from . import sphere
-from .warp import sample_equirect, to_float
+from . import sphere, topology
+from .sampling import sample_equirect, to_float
 
 
 def luminance(img: np.ndarray) -> np.ndarray:

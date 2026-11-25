@@ -14,7 +14,7 @@ import numpy as np
 
 from . import sphere
 from .estimate import MatchConfig, luminance
-from .warp import to_float
+from .sampling import to_float
 
 
 def sample_uv_clamp(img, u, v):

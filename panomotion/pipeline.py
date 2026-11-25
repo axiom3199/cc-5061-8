@@ -15,9 +15,12 @@ from . import metrics as M
 from . import sphere
 from .baseline import estimate_pair_planar
 from .estimate import MatchConfig, estimate_pair, fit_global_rotation, match_batch, luminance
+from . import field
 from . import media
-from .tracking import build_seed_tracks, compute_tracks
-from .warp import (fill_missing_omega, photometric_error, reproject_frame,
+from . import motion as motion_mod
+from .hotspots import HotspotEditor
+from .tracking import build_seed_tracks, compute_tracks, track_hotspot_anchor
+from .field import (fill_missing_omega, photometric_error, reproject_frame,
                    to_float)
 
 
@@ -110,6 +113,112 @@ def classify_with_backward(res, lum_a, lum_b, pcfg: PipelineConfig,
     }
 
 
+def build_hotspots(seq, pair_motions, width: int, height: int,
+                   pcfg: PipelineConfig, frames=None, global_Rs=None,
+                   mcfg=None):
+    """Create motion-driven hotspots and verify the two projection outlets.
+
+    Boundary condition exercised here: each hotspot is one spherical object.
+    The equirect outlet may split its outline into several seam fragments and
+    the perspective outlet may cull part of it, but both must report exactly
+    the same hotspot id set - no extra hotspot may appear at the seam.  When
+    ground truth is available the transported anchors are also checked by
+    spherical angular error against the true object motion, and the valid
+    region coverage is recorded so the equivalence claim carries numbers.
+    """
+    from .projection import (EquirectProjection, PerspectiveProjection,
+                             SphericalRegion, region_coverage)
+
+    editor = HotspotEditor(pair_motions, pick_tol_deg=8.0)
+    anchors = []
+    if seq is not None:
+        for obj in seq.objects:
+            cam_dir0 = sphere.normalize(seq.Rs[0].T @ obj.centers[0])
+            anchors.append((obj.name, cam_dir0, obj.half_angle_deg * 0.9))
+    else:
+        rng = np.random.default_rng(5)
+        for k in range(2):
+            d = sphere.normalize(rng.normal(size=3))
+            anchors.append((f"hotspot-{k + 1}", d, 5.0))
+
+    created = []
+    weak_by_id = {}
+    for name, anchor, radius_deg in anchors:
+        if frames is not None:
+            # Sparse spherical match chain: the actual measured object motion,
+            # including motion that disagrees with the dominant rotation.
+            chain, weak = track_hotspot_anchor(
+                frames, anchor, global_Rs, mcfg)
+            hs = editor.add(anchor, name=name, radius_deg=radius_deg,
+                            chain=chain)
+            weak_by_id[hs.hotspot_id] = weak
+        else:
+            created.append(editor.add(
+                anchor, name=name, radius_deg=radius_deg))
+
+    eq = EquirectProjection(width, height)
+    # A view centred on each hotspot so the perspective outlet has a non-empty
+    # valid region; the wide FOV keeps the whole geodesic cap in front.
+    checks = []
+    for hs in editor.hotspots:
+        center0 = hs.direction_at(0)
+        persp = PerspectiveProjection.look_at(
+            width // 2, height // 2, center0,
+            fov_rad=np.deg2rad(120.0), near=1e-3)
+        verdict = editor.clip_hotspot(
+            hs.hotspot_id, {"equirect": eq, "perspective": persp}, frame=0)
+        n_eq = len(verdict["fragments"]["equirect"])
+        n_pe = len(verdict["fragments"]["perspective"])
+        region = hs.region_at(0)
+        outline = hs.outline_dirs(0, samples=120)
+        coverage = region_coverage(region, outline)
+        checks.append({
+            "hotspot_id": hs.hotspot_id,
+            "name": hs.name,
+            "equirect_fragment_count": n_eq,
+            "perspective_fragment_count": n_pe,
+            "object_ids_equirect": sorted(
+                f.object_id for f in verdict["fragments"]["equirect"]),
+            "object_ids_perspective": sorted(
+                f.object_id for f in verdict["fragments"]["perspective"]),
+            "same_spherical_object": verdict["equivalent"],
+            "valid_region_coverage": round(coverage, 4),
+            "weak_match_pairs": weak_by_id.get(hs.hotspot_id, []),
+        })
+
+    # Ground-truth angular error of the motion-driven anchor chain.
+    gt_errors = []
+    if seq is not None:
+        label_by_name = {o.name: o.label for o in seq.objects}
+        for hs in editor.hotspots:
+            label = label_by_name.get(hs.name)
+            if label is None:
+                continue
+            obj = next(o for o in seq.objects if o.label == label)
+            est_chain = hs.trajectory.chain
+            gt_chain = np.stack([
+                sphere.normalize(seq.Rs[t].T @ obj.centers[t])
+                for t in range(seq.n_frames)])
+            err = np.rad2deg(sphere.geodesic_angle(est_chain, gt_chain))
+            gt_errors.append({
+                "hotspot_id": hs.hotspot_id,
+                "name": hs.name,
+                "angular_error_deg": np.round(err, 4).tolist(),
+                "median_error_deg": round(float(np.median(err)), 4),
+                "max_error_deg": round(float(err.max()), 4),
+                "valid_fraction": 1.0,
+            })
+
+    return {
+        "hotspots": editor.to_list(),
+        "projection_checks": checks,
+        "gt_angular_error": gt_errors,
+        "boundary_policy": (
+            "两个投影出口裁剪同一球面热点；接缝分裂段共享 hotspot_id，"
+            "不得在接缝处产生第二个热点"),
+    }
+
+
 def _panel(img, title, w=470, h=236):
     from PIL import Image, ImageDraw
     im = Image.fromarray(img).resize((w, h), Image.BILINEAR).convert("RGB")
@@ -147,6 +256,8 @@ def run_pipeline(frames, run_dir, seq=None, pcfg: PipelineConfig | None = None,
     gt_motion_frames = []
     est_motion_frames = []
     reproj_psnrs, gt_psnrs = [], []
+    pair_motions = []
+    pair_omega_pixels = []
 
     for t in range(n - 1):
         t_start = time.time()
@@ -173,11 +284,19 @@ def run_pipeline(frames, run_dir, seq=None, pcfg: PipelineConfig | None = None,
         cls_grid = cls.reshape(pcfg.rows, pcfg.cols)
         omega_grid[cls_grid == 1] = verdict["global_omega"]
         credible_grid = credible.reshape(pcfg.rows, pcfg.cols)
-        omega_filled = fill_missing_omega(
+        omega_filled = field.fill_missing_omega(
             omega_grid, credible_grid, verdict["global_omega"], passes=30)
 
-        warped = reproject_frame(frames[t], omega_filled)
-        rp_metrics, diff = photometric_error(frames[t + 1], warped)
+        # Frozen spherical-motion interface for this pair; the same object
+        # drives reprojection, hotspot transport and the player's motion API.
+        sph_motion = motion_mod.SphereMotion(
+            omega_filled, w, h, verdict["global_omega"])
+        pair_motions.append(sph_motion)
+        omega_px = field.interpolate_omega_grid(omega_filled, w, h)
+        pair_omega_pixels.append(omega_px)
+
+        warped = field.reproject_frame(frames[t], omega_filled)
+        rp_metrics, diff = field.photometric_error(frames[t + 1], warped)
         reproj_psnrs.append(rp_metrics["psnr"])
         media.save_jpg(warped, run_dir / "reproj" / f"reproj_{t:03d}.jpg", 88)
         heat = media.error_heatmap(diff, scale=5.0)
@@ -187,8 +306,8 @@ def run_pipeline(frames, run_dir, seq=None, pcfg: PipelineConfig | None = None,
         if has_gt:
             gt_omega = sphere.rotation_vector_between(src, gt_dirs) \
                 .reshape(pcfg.rows, pcfg.cols, 3)
-            gt_warped = reproject_frame(frames[t], gt_omega)
-            gt_rp, _ = photometric_error(frames[t + 1], gt_warped)
+            gt_warped = field.reproject_frame(frames[t], gt_omega)
+            gt_rp, _ = field.photometric_error(frames[t + 1], gt_warped)
             gt_reproj_psnr = gt_rp["psnr"]
             gt_psnrs.append(gt_reproj_psnr)
 
@@ -276,6 +395,11 @@ def run_pipeline(frames, run_dir, seq=None, pcfg: PipelineConfig | None = None,
             pair_json["error_deg"] = np.round(err, 3)
             pair_json["error_stats"] = err_stats
             pair_json["gt_reproj_psnr"] = round(gt_reproj_psnr, 2)
+        # Real spherical motion for the player's motion interface: world-frame
+        # rotation vectors on the analysis grid, plus the dominant rotation.
+        pair_json["omega_grid"] = np.round(omega_filled, 8).tolist()
+        pair_json["global_omega"] = np.round(
+            verdict["global_omega"], 8).tolist()
         write_json(pair_json, run_dir / "data" / f"pair_{t:03d}.json")
 
         pair_reports.append({
@@ -314,6 +438,15 @@ def run_pipeline(frames, run_dir, seq=None, pcfg: PipelineConfig | None = None,
     seeds = build_seed_tracks(seq)
     tracks = compute_tracks(frames, seeds, global_Rs, seq, mcfg)
     write_json(tracks, run_dir / "tracks.json")
+
+    # Motion-field driven hotspots.  Anchors are unit directions at frame 0;
+    # the same SphereMotion pair fields transport them frame by frame, so the
+    # hotspot stays glued to the panorama across the seam and the poles.
+    emit("hotspots", 1.0, "由运动场驱动全景热点并核对双投影裁剪")
+    hotspot_doc = build_hotspots(seq, pair_motions, w, h, pcfg,
+                                 frames=frames, global_Rs=global_Rs,
+                                 mcfg=mcfg)
+    write_json(hotspot_doc, run_dir / "hotspots.json")
 
     # Videos.
     emit("video", 1.0, "写出视频")

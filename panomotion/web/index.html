@@ -68,6 +68,7 @@
         <label><input type="checkbox" id="tgSeam" checked /> 经度接缝</label>
         <label><input type="checkbox" id="tgPolar" checked /> 极区标注</label>
         <label><input type="checkbox" id="tgRejected" /> 未支持匹配点</label>
+        <label><input type="checkbox" id="tgHotspots" checked /> 全景热点</label>
       </div>
     </div>
 
@@ -110,6 +111,32 @@
     </section>
 
     <section class="card">
+      <div class="card-head"><h2>球面运动接口（实际转动视角并查运动）</h2></div>
+      <div class="motion-panel">
+        <div class="motion-btns">
+          <button id="btnFollowHotspot" class="btn">跟随热点转动视角</button>
+          <button id="btnStepMotion" class="btn">推进一帧球面运动</button>
+          <button id="btnStabilize" class="btn primary">运动场稳定热点</button>
+        </div>
+        <div id="motionReadout" class="motion-readout muted">
+          按钮调用后端 <code>/api/motion</code> 的真实 ω 场，不使用固定数据。
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>全景热点编辑器（球面对象 · 接缝不重复）</h2></div>
+      <div class="hotspot-panel">
+        <div class="hotspot-btns">
+          <button id="btnAddHotspot" class="btn">在点击处添加热点</button>
+          <button id="btnClearHotspots" class="btn">清空热点</button>
+        </div>
+        <div id="hotspotList" class="hotspot-list muted">热点锚点为单位球面方向，跨接缝/极点保持同一 id。</div>
+        <div id="hotspotEvidence" class="hotspot-evidence"></div>
+      </div>
+    </section>
+
+    <section class="card">
       <div class="card-head"><h2>接缝连续性（实际运算）</h2></div>
       <div id="seamBox"></div>
     </section>
@@ -135,6 +162,7 @@
   </aside>
 </main>
 
+<script src="sphere_transform.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
